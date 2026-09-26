@@ -26,3 +26,10 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Build artefacts from the Sendspin mod work. The release zip is regenerated
+# from mod/ and must not be committed; the source of truth is the mod folder.
+sendspin-radio.zip
+node_modules/
+dist/
+.venv/
