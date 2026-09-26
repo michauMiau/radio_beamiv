@@ -22,6 +22,10 @@ const { lua, events } = useBridge()
 const MOD_ROOT = "/ui/ui-vue/mods/SendspinRadio"
 const TITLE = "Sendspin Radio"
 
+// Name of the Lua extension that owns the loopback relay. Must match the file
+// path lua/ge/extensions/SendspinRadio.lua exactly.
+const EXTENSION = "SendspinRadio"
+
 function addMainMenuButton(addButton) {
   addButton({
     title: TITLE,
@@ -73,8 +77,25 @@ function installHotReloadCleanup() {
   })
 }
 
+async function ensureLuaExtension() {
+  // Belt and braces. scripts/sendspin_radio/modScript.lua is the documented way
+  // to load the relay, but if that ever fails the page can still pull the
+  // extension in itself, so the player degrades to a clear diagnostic instead
+  // of a silent timeout.
+  try {
+    if (await lua.extensions.isExtensionLoaded(EXTENSION)) return "already loaded"
+    await lua.extensions.load(EXTENSION)
+    return "loaded from the page"
+  } catch (e) {
+    return `could not load (${e?.message || e})`
+  }
+}
+
 export async function onLoad() {
   installHotReloadCleanup()
+
+  const relay = await ensureLuaExtension()
+  console.info(`SendspinRadio: Lua relay ${relay}`)
 
   const routeResult = await registerRoutes()
   if (routeResult?.success) {
