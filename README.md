@@ -82,12 +82,51 @@ bare connection error.
 The mod ships as a zip; the source of truth is the `mod/` folder.
 
 ```bash
-cd mod
-zip -r ../sendspin-radio.zip lua ui README.md -x "*.DS_Store"
+npm run build:zip
 ```
+
+That zips the whole of `mod/`, which matters: the zip must contain
+`lua/`, `ui/` **and** `scripts/`. The mod script is what actually loads the
+extension — a file merely sitting in `lua/ge/extensions/` is never executed.
 
 `sendspin-radio.zip` is deliberately git-ignored, since it is generated from
 `mod/`.
+
+## Development
+
+```bash
+npm test        # all three test suites
+npm run lint    # luacheck (Lua) + eslint --max-warnings 0 (JS/Vue)
+```
+
+Individually:
+
+| Command | What it proves |
+| --- | --- |
+| `npm run test:structure` | the extension defines the hooks BeamNG actually calls, loads LuaSocket logging correctly, selects before reading, and both sides agree on the relay port |
+| `npm run test:contract` | binary data still comes back through `receive()`'s third result |
+| `npm run test:e2e` | the real extension forwards a byte-exact handshake, returns a real `101`, survives two reconnects, and passes binary audio through unmodified |
+| `npm run test:e2e -- -v` | same, with per-tick detail |
+
+The E2E test needs `lua5.1` and LuaSocket (`lua-socket` on Debian) and uses
+only loopback ports, so it never touches your Music Assistant. The Lua tests
+rewrite a throwaway copy of the extension under `tests/.tmp/` with loopback
+ports; the committed file always keeps your real address.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and PR to `main`, in four jobs:
+
+- **Lint** — luacheck on `mod/`, ESLint on the Vue mod
+- **Package structure** — the static checks above
+- **LuaSocket read contract** — the `partial` result contract
+- **Relay end-to-end** — the full relay drive
+
+Lua 5.1 is installed explicitly because BeamNG runs GELua 5.1; another version
+could let socket-contract differences through.
+
+`package-lock.json` is committed on purpose, so `npm ci` pins the lint
+toolchain exactly.
 
 ## Troubleshooting
 
