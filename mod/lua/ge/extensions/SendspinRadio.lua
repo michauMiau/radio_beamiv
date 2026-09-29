@@ -26,16 +26,25 @@ local listener = nil   -- listening socket on loopback
 local pageSock = nil    -- connection from the Vue page
 local upstream = nil    -- connection to Music Assistant
 local partial = ''      -- bytes buffered heading upstream
+local bindError = nil   -- last bind failure, so it is only logged once
 local READ_SIZE = 65536
 
+-- BeamNG provides the global log(level, origin, msg). extensions.core.log does
+-- not exist, and calling it with two arguments would drop the origin anyway, so
+-- every log line was being discarded silently - which is exactly why the game
+-- log showed nothing from this extension.
+local LOG_ORIGIN = 'sendspinRadio'
+
 local function log(level, fmt, ...)
-  local fn = extensions and extensions.core and extensions.core.log
-  if not fn then return end
+  if type(_G.log) ~= 'function' then return end
+  local msg
   if select('#', ...) > 0 then
-    fn(level, '[SendspinRadio] ' .. string.format(fmt, ...))
+    local ok, formatted = pcall(string.format, fmt, ...)
+    msg = ok and formatted or tostring(fmt)
   else
-    fn(level, '[SendspinRadio] ' .. tostring(fmt))
+    msg = tostring(fmt)
   end
+  pcall(_G.log, level, LOG_ORIGIN, msg)
 end
 
 local function closeQuietly(sock, what)
@@ -96,25 +105,44 @@ local function connectUpstream()
 end
 
 -- Forward anything buffered on the upstream link back to the page.
+--
+-- luasocket's receive() returns (line|nil, err, partial). On a non-blocking
+-- socket that has data waiting it returns (line, nil, partial) - the payload is
+-- the THIRD value. Wrapping that in pcall shifts EVERYTHING right by one, so
+-- through pcall the payload lands in the FOURTH return and reading the third
+-- yielded nil, which this loop then treated as "nothing to do".
 local function drainUpstream()
   if not (upstream and pageSock) then return end
   while true do
-    local ok, data, err = pcall(upstream.receive, upstream, READ_SIZE)
-    if not ok then
-      log('E', 'upstream receive failed')
+    -- Only read what select says is actually there. Reading speculatively on a
+    -- non-blocking socket returns err='closed' for a perfectly healthy
+    -- connection that simply has nothing queued yet, and that error then tore
+    -- down the link in a loop.
+    local readable, _, _, err = socket.select({ upstream }, nil, 0)
+    if err then
+      log('W', 'select on upstream failed: %s', tostring(err))
       closeQuietly(upstream, 'upstream')
       return
     end
-    if data == nil or data == '' then
-      if err and err ~= 'timeout' then
-        log('W', 'upstream read ended: %s', tostring(err))
+    if #readable == 0 then return end
+
+    local ok, line, rerr, chunk = pcall(upstream.receive, upstream, READ_SIZE)
+    if not ok then
+      log('E', 'upstream receive raised: %s', tostring(line))
+      closeQuietly(upstream, 'upstream')
+      return
+    end
+    if not chunk or chunk == '' then chunk = line end
+    if not chunk or chunk == '' then
+      if rerr and rerr ~= 'timeout' and rerr ~= 'closed' then
+        log('W', 'upstream read ended: %s', tostring(rerr))
         closeQuietly(upstream, 'upstream')
       end
       return
     end
-    local sent = pcall(function() return pageSock:send(data) end)
-    if not sent then
-      log('W', 'could not deliver to page, dropping upstream')
+    local sent, serr = pageSock:send(chunk)
+    if not sent and serr ~= 'timeout' then
+      log('W', 'could not deliver to page (%s), dropping upstream', tostring(serr))
       closeQuietly(upstream, 'upstream')
       return
     end
@@ -133,10 +161,17 @@ local function startListener()
 
   local bound, err = sock:bind(M.LOCAL_HOST, M.LOCAL_PORT)
   if not bound then
-    log('E', 'cannot bind %s:%d: %s', M.LOCAL_HOST, M.LOCAL_PORT, tostring(err))
+    -- startListener is retried from the update hook, so a failure that is
+    -- logged every single tick would flood the console with thousands of
+    -- identical lines and cost frames. Report it once, then stay quiet.
+    if bindError ~= tostring(err) then
+      bindError = tostring(err)
+      log('E', 'cannot bind %s:%d: %s', M.LOCAL_HOST, M.LOCAL_PORT, bindError)
+    end
     pcall(function() sock:close() end)
     return nil
   end
+  bindError = nil
 
   if not sock:listen(8) then
     log('E', 'listen failed on %s:%d', M.LOCAL_HOST, M.LOCAL_PORT)
@@ -154,12 +189,16 @@ end
 local function acceptPage()
   if not listener then return end
 
-  local readable = { listener }
-  local _, _, err = socket.select(readable, nil, 0)
-  if err ~= 'timeout' then
-    if err then log('W', 'select on listener failed: %s', tostring(err)) end
+  -- socket.select returns (readable, writable, exceptional, err). With a zero
+  -- timeout the third result carries the string 'timeout' when nothing is
+  -- pending, NOT the fourth. Reading err here made this always look like a
+  -- real error, so the accept below was never reached.
+  local readable, _, exceptional, err = socket.select({ listener }, nil, 0)
+  if err then
+    log('W', 'select on listener failed: %s', tostring(err))
     return
   end
+  if #readable == 0 then return end
 
   local sock, addr = listener:accept()
   if not sock then return end
@@ -186,26 +225,36 @@ local function pump()
 
   -- page -> upstream
   if upstream then
-    local readable = { pageSock }
-    local _, _, err = socket.select(readable, nil, 0)
-    if err == 'timeout' then
-      -- nothing waiting, fall through to the other direction
-    elseif err then
+    -- Same select contract as above: 'timeout' arrives in the third result.
+    local readable, _, exceptional, err = socket.select({ pageSock }, nil, 0)
+    if err then
       log('W', 'select on page socket failed: %s', tostring(err))
       closeQuietly(pageSock, 'page socket')
+    elseif #readable == 0 then
+      -- nothing waiting, fall through to the other direction
     else
-      local ok, data, rerr = pcall(pageSock.receive, pageSock, READ_SIZE)
-      if ok and data and data ~= '' then
-        partial = partial .. data
-        local sent = pcall(function() return upstream:send(partial) end)
-        if sent then
-          partial = ''
-        else
-          log('W', 'upstream send failed, dropping link')
+      -- receive() through pcall returns (ok, line, err, partial): the pcall
+      -- boolean shifts the real values right by one. Data waiting on a
+      -- non-blocking socket lands in slot 4.
+      local ok, line, rerr, chunk = pcall(pageSock.receive, pageSock, READ_SIZE)
+      if not ok then
+        log('W', 'page receive raised: %s', tostring(line))
+        closeQuietly(pageSock, 'page socket')
+        return
+      end
+      if not chunk or chunk == '' then chunk = line end
+      if chunk and chunk ~= '' then
+        partial = partial .. chunk
+        -- send() returns the number of bytes written; a would-block write
+        -- returns nil,'timeout'. Keep the unwritten remainder for the next pump
+        -- and only give up on a real error.
+        local sent, serr = upstream:send(partial)
+        if type(sent) == 'number' then
+          partial = partial:sub(sent + 1)
+        elseif serr ~= 'timeout' then
+          log('W', 'upstream send failed (%s), dropping link', tostring(serr))
           closeQuietly(upstream, 'upstream')
         end
-      elseif not ok then
-        closeQuietly(pageSock, 'page socket')
       elseif rerr and rerr ~= 'timeout' and rerr ~= 'closed' then
         log('W', 'page read: %s', tostring(rerr))
       end
@@ -221,6 +270,9 @@ M.setUpstream = function(host, port)
   log('I', 'upstream now %s:%d', M.UPSTREAM_HOST, M.UPSTREAM_PORT)
   closeQuietly(upstream, 'upstream')
   upstream = nil
+  -- Anything buffered belonged to the old link; forwarding it to a different
+  -- server would corrupt the new stream from the first byte.
+  partial = ''
   return M.UPSTREAM_HOST, M.UPSTREAM_PORT
 end
 
@@ -288,18 +340,43 @@ end
 -- Kept so older builds still work.
 M.onLoad = M.onExtensionLoaded
 
-M.onUnload = function()
+-- BeamNG calls onExtensionUnloaded. `onUnload` is never fired, so without this
+-- the listener and both sockets would survive a level change and the bind would
+-- fail on reload.
+M.onExtensionUnloaded = function()
   M.stop()
 end
+M.onUnload = M.onExtensionUnloaded
 
--- onUpdate runs once per rendered frame, which is far too often for select()
--- and costs frames. onCfxUpdate is driven by the extension scheduler and is the
--- right cadence for pumping a socket: still responsive, but not per-frame.
-M.onCfxUpdate = function()
+-- BeamNG's GE frame hook is onUpdate ("called once per GFX frame"); onGuiUpdate
+-- runs at UI rate. There is no onCfxUpdate in BeamNG - that is a FiveM name -
+-- so with it the accept/pump pair was never called at all.
+--
+-- onGuiUpdate is the one that matters: the page's WebSocket lives in the UI
+-- thread, so this is what keeps audio flowing while the game is paused.
+M.onGuiUpdate = function()
   if not listener then
     startListener()
     return
   end
+  acceptPage()
+  pump()
+end
+
+-- Also pump on graphics frames so the relay keeps working with no UI open, but
+-- only every few frames: a socket does not need graphics-frame cadence and
+-- select() on every rendered frame costs frames for nothing.
+local frameCounter = 0
+local FRAME_STRIDE = 6
+
+M.onUpdate = function()
+  if not listener then
+    startListener()
+    return
+  end
+  frameCounter = frameCounter + 1
+  if frameCounter < FRAME_STRIDE then return end
+  frameCounter = 0
   acceptPage()
   pump()
 end
