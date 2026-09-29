@@ -1,35 +1,27 @@
-# Angular specific
-/dist/
-/out-tsc/
-/tmp/
-/coverage/
-/e2e/test-output/
-/.angular/
-.angular/
-
-# Node modules and dependency files
+# Node
 /node_modules/
-/package-lock.json
-/yarn.lock
-
-# Environment files
-/.env
-
-# Angular CLI and build artefacts
-/.angular-cli.json
-/.ng/
-
-# TypeScript cache
-*.tsbuildinfo
-
-# Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Build artefacts from the Sendspin mod work. The release zip is regenerated
-# from mod/ and must not be committed; the source of truth is the mod folder.
-sendspin-radio.zip
-node_modules/
-dist/
+# package-lock.json IS committed on purpose: CI runs `npm ci`, which fails
+# without a lockfile and is the whole point of pinning the lint toolchain.
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
 .venv/
+.pytest_cache/
+
+# Scratch copies the relay tests generate: they are rewritten per run with
+# loopback ports, so committing them would be noise at best and misleading
+# (they point at ports that do not exist) at worst.
+tests/.tmp/
+
+# Release artefact. Regenerate with `npm run build:zip` from mod/; the source
+# of truth is the mod folder, not the zip.
+sendspin-radio.zip
+
+# Editor / OS
+.DS_Store
+*.swp

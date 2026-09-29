@@ -93,7 +93,8 @@ local function connectUpstream()
 
   local ok, err = sock:connect(M.UPSTREAM_HOST, M.UPSTREAM_PORT)
   if not ok then
-    log('E', 'upstream connect to %s:%d failed: %s', M.UPSTREAM_HOST, M.UPSTREAM_PORT, tostring(err))
+    log('E', 'upstream connect to %s:%d failed: %s', M.UPSTREAM_HOST,
+        M.UPSTREAM_PORT, tostring(err))
     pcall(function() sock:close() end)
     return nil
   end
@@ -193,7 +194,7 @@ local function acceptPage()
   -- timeout the third result carries the string 'timeout' when nothing is
   -- pending, NOT the fourth. Reading err here made this always look like a
   -- real error, so the accept below was never reached.
-  local readable, _, exceptional, err = socket.select({ listener }, nil, 0)
+  local readable, _, _, err = socket.select({ listener }, nil, 0)
   if err then
     log('W', 'select on listener failed: %s', tostring(err))
     return
@@ -226,13 +227,11 @@ local function pump()
   -- page -> upstream
   if upstream then
     -- Same select contract as above: 'timeout' arrives in the third result.
-    local readable, _, exceptional, err = socket.select({ pageSock }, nil, 0)
+    local readable, _, _, err = socket.select({ pageSock }, nil, 0)
     if err then
       log('W', 'select on page socket failed: %s', tostring(err))
       closeQuietly(pageSock, 'page socket')
-    elseif #readable == 0 then
-      -- nothing waiting, fall through to the other direction
-    else
+    elseif #readable > 0 then
       -- receive() through pcall returns (ok, line, err, partial): the pcall
       -- boolean shifts the real values right by one. Data waiting on a
       -- non-blocking socket lands in slot 4.

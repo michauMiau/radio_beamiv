@@ -1,0 +1,90 @@
+name: CI
+
+# Every push and PR runs the same gates. The relay once shipped broken while
+# every ad-hoc check I ran locally said it was fine, so the gates below are the
+# ones that actually catch its failure modes, not a generic "does it lint" pass.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (Lua + JS/Vue)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.1 and LuaSocket
+        # BeamNG runs GELua 5.1; testing against another version would let
+        # syntax and socket-contract differences through.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 lua-socket
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get install -y -qq luarocks
+          sudo luarocks install luacheck
+
+      - name: Luacheck
+        run: luacheck mod/
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: ESLint
+        run: npx eslint . --max-warnings 0
+
+  structure:
+    name: Package structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run structural checks
+        run: python3 tests/package_structure.py
+
+  lua-contract:
+    name: LuaSocket read contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1 and LuaSocket
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 lua-socket
+      - name: Verify the partial-result contract still holds
+        # Binary data arrives ONLY in receive()'s third result. If a toolchain
+        # change breaks that, audio dies silently while HTTP still works.
+        run: python3 tests/luasocket_contract.py
+
+  relay-e2e:
+    name: Relay end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1 and LuaSocket
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1 lua-socket
+      - name: Drive the real extension against a loopback upstream
+        # No Music Assistant involved: the test binds loopback ports and
+        # rewrites a scratch copy of the extension to match.
+        run: python3 tests/relay_e2e.py

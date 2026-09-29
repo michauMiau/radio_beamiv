@@ -37,7 +37,6 @@ export const playerState = reactive({
 
 let player = null
 let progressTimer = null
-let lastProgressStamp = 0
 
 function describeError(err) {
   if (!err) return "unknown error"
@@ -77,11 +76,13 @@ function startProgressTicker() {
       if (info && typeof info.positionMs === "number") {
         playerState.progressMs = info.positionMs
         if (typeof info.durationMs === "number") playerState.durationMs = info.durationMs
-        lastProgressStamp = info.positionMs
       }
     } catch (e) {
       // trackProgress can throw while the stream is renegotiating.
     }
+    // Sync error is read by the diagnostics panel, so it has to be sampled
+    // here; a function that is never called leaves the readout stuck at "—".
+    refreshSyncInfo()
   }, 500)
 }
 
@@ -98,7 +99,8 @@ function refreshSyncInfo() {
     const info = player.syncInfo
     if (info) playerState.syncErrorMs = info.syncErrorMs
   } catch (e) {
-    // not fatal — sync info is informational only
+    // not fatal — sync info is informational only, so leave the last good
+    // reading rather than blanking the readout.
   }
 }
 
@@ -195,7 +197,6 @@ export async function connect() {
   playerState.status = "connecting"
   playerState.error = ""
 
-  let sock
   try {
     const p = createPlayer()
     // The SDK adopts the socket, so it has to be open first.
@@ -209,12 +210,14 @@ export async function connect() {
     playerState.status = "error"
     playerState.error = describeError(e)
     // A failed attempt leaves a half-initialised socket behind; drop it so the
-    // next attempt starts from a clean object.
+    // next attempt starts from a clean object. `player` is the only live
+    // reference to the socket, so closing the player is what closes it.
     if (player) {
-      try { player.disconnect() } catch (_) {}
-    }
-    if (sock) {
-      try { sock.close() } catch (_) {}
+      try {
+        player.disconnect()
+      } catch (closeError) {
+        console.warn("Sendspin: disconnect after failed connect threw", closeError)
+      }
     }
     player = null
     playerState.hasPlayer = false
@@ -227,9 +230,20 @@ export function disconnect() {
     // close it explicitly. Leaving it open makes the Lua relay see a stale
     // second connection, which is what surfaces as a socket error on reconnect.
     const sock = player.__sock
-    try { player.disconnect() } catch (e) {}
+    // Both closes are best-effort: the teardown must continue even when the SDK
+    // or the socket refuses, otherwise one failure strands the page. Swallowing
+    // silently would hide a socket that never closes, so it is logged.
+    try {
+      player.disconnect()
+    } catch (disconnectError) {
+      console.warn("Sendspin: player.disconnect() threw during teardown", disconnectError)
+    }
     if (sock && sock.readyState !== WebSocket.CLOSED) {
-      try { sock.close() } catch (e) {}
+      try {
+        sock.close()
+      } catch (closeError) {
+        console.warn("Sendspin: socket.close() threw during teardown", closeError)
+      }
     }
   }
   stopProgressTicker()
@@ -305,7 +319,13 @@ export function setVolume(value) {
   settings.volume = clamped
   saveSettings(settings)
   if (player) {
-    try { player.setVolume(clamped) } catch (e) {}
+    // The SDK throws if the socket is already gone; volume is a local pref too,
+    // so keep the stored value and report the failure rather than lose it.
+    try {
+      player.setVolume(clamped)
+    } catch (volumeError) {
+      console.warn("Sendspin: setVolume threw; stored volume kept", volumeError)
+    }
   }
 }
 
@@ -313,7 +333,11 @@ export function toggleMute() {
   if (!player) return
   const next = !playerState.muted
   playerState.muted = next
-  try { player.setMuted(next) } catch (e) {}
+  try {
+    player.setMuted(next)
+  } catch (muteError) {
+    console.warn("Sendspin: setMuted threw; local mute state kept", muteError)
+  }
 }
 
 export function openPairingWindow() {

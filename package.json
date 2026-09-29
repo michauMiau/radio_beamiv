@@ -1,0 +1,33 @@
+{
+  "name": "radio_beamiv",
+  "version": "1.0.0",
+  "description": "Sendspin Radio for BeamNG.drive - a Vue mod that streams Music Assistant over a local LuaSocket relay.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/michauMiau/radio_beamiv.git"
+  },
+  "bugs": {
+    "url": "https://github.com/michauMiau/radio_beamiv/issues"
+  },
+  "homepage": "https://github.com/michauMiau/radio_beamiv#readme",
+  "scripts": {
+    "test": "python3 tests/package_structure.py && python3 tests/luasocket_contract.py && python3 tests/relay_e2e.py",
+    "test:structure": "python3 tests/package_structure.py",
+    "test:contract": "python3 tests/luasocket_contract.py",
+    "test:e2e": "python3 tests/relay_e2e.py",
+    "lint": "luacheck mod/ && eslint . --max-warnings 0",
+    "lint:lua": "luacheck mod/",
+    "lint:js": "eslint . --max-warnings 0",
+    "build:zip": "cd mod && zip -qr ../sendspin-radio.zip . -x '*.DS_Store' && echo \"built sendspin-radio.zip\""
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^9.39.5",
+    "eslint-plugin-vue": "^10.11.1",
+    "globals": "^17.12.0",
+    "vue-eslint-parser": "^10.4.1"
+  }
+}
