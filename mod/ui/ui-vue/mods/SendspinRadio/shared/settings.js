@@ -49,5 +49,9 @@ export function sendspinWsUrl(s = settings) {
 // (SendspinRadio.lua) pumps through to the real Music Assistant server.
 export function relayWsUrl(s = settings) {
   const port = s.relayPort || 18124
-  return `ws://127.0.0.1:${port}/sendspin`
+  // BeamNG's CSP has named both loopback spellings across builds; a name the
+  // policy does not mention is refused before a byte leaves, so the player
+  // retries the other one rather than reporting a dead relay.
+  const host = s.relayHost || "127.0.0.1"
+  return `ws://${host}:${port}/sendspin`
 }

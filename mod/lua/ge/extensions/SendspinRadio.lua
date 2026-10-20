@@ -26,8 +26,29 @@ local listener = nil   -- listening socket on loopback
 local pageSock = nil    -- connection from the Vue page
 local upstream = nil    -- connection to Music Assistant
 local partial = ''      -- bytes buffered heading upstream
+local toPage = ''       -- upstream bytes the page has not accepted yet
 local bindError = nil   -- last bind failure, so it is only logged once
 local READ_SIZE = 65536
+
+-- Per-session diagnostics. Until these existed the log could say "page
+-- connected" and nothing else, which cannot tell whether the browser's
+-- handshake was read, whether it reached Music Assistant, or whether the 101
+-- came back - the three places the byte stream can actually die.
+local sessionNo = 0         -- page connections accepted since load
+local bytesToUp = 0         -- page -> upstream, cumulative
+local bytesToPage = 0       -- upstream -> page, cumulative
+local pageBytesSeen = false -- has this session's browser sent anything at all
+local silentTicks = 0       -- UI ticks this session has been open and silent
+local loggedPageFirst = false
+local loggedUpFirst = false
+local loggedDownFirst = false
+local loggedNoUpstream = false
+
+-- A page connected for this many UI ticks without sending one byte means the
+-- browser never started the handshake - a CEF/CSP problem that no amount of
+-- pumping can fix, so the log should say it outright instead of leaving a
+-- generic socket timeout as the only clue.
+local SILENT_TICK_LIMIT = 300
 
 -- BeamNG provides the global log(level, origin, msg). extensions.core.log does
 -- not exist, and calling it with two arguments would drop the origin anyway, so
@@ -120,9 +141,14 @@ local function drainUpstream()
     -- connection that simply has nothing queued yet, and that error then tore
     -- down the link in a loop.
     local readable, _, _, err = socket.select({ upstream }, nil, 0)
-    if err then
-      log('W', 'select on upstream failed: %s', tostring(err))
-      closeQuietly(upstream, 'upstream')
+    if type(readable) ~= 'table' then
+      -- A select that fails returns no table at all; #nil would raise into the
+      -- frame hook and kill the relay for the rest of the session.
+      if err then
+        log('W', 'select on upstream failed: %s', tostring(err))
+        closeQuietly(upstream, 'upstream')
+        upstream = nil
+      end
       return
     end
     if #readable == 0 then return end
@@ -131,20 +157,47 @@ local function drainUpstream()
     if not ok then
       log('E', 'upstream receive raised: %s', tostring(line))
       closeQuietly(upstream, 'upstream')
+      upstream = nil
       return
     end
     if not chunk or chunk == '' then chunk = line end
     if not chunk or chunk == '' then
-      if rerr and rerr ~= 'timeout' and rerr ~= 'closed' then
+      if rerr == 'closed' then
+        log('I', 'Music Assistant closed the upstream link (session %d)',
+            sessionNo)
+        closeQuietly(upstream, 'upstream')
+        upstream = nil
+        return
+      end
+      if rerr and rerr ~= 'timeout' then
         log('W', 'upstream read ended: %s', tostring(rerr))
         closeQuietly(upstream, 'upstream')
+        upstream = nil
       end
       return
     end
-    local sent, serr = pageSock:send(chunk)
-    if not sent and serr ~= 'timeout' then
-      log('W', 'could not deliver to page (%s), dropping upstream', tostring(serr))
+
+    bytesToPage = bytesToPage + #chunk
+    if not loggedDownFirst then
+      loggedDownFirst = true
+      -- Whether the 101 is in the FIRST chunk from Music Assistant answers the
+      -- whole "did the upgrade ever complete" question in one line.
+      log('I', 'upstream -> page: first %d bytes, contains 101=%s (session %d)',
+          #chunk, tostring(chunk:find('101 Switching', 1, true) ~= nil),
+          sessionNo)
+    end
+
+    -- Queue instead of writing straight through: a would-block socket reports
+    -- how much it took and the remainder has to survive until the next pump.
+    toPage = toPage .. chunk
+    local sent, serr = pageSock:send(toPage)
+    if type(sent) == 'number' then
+      toPage = toPage:sub(sent + 1)
+    elseif serr and serr ~= 'timeout' then
+      log('W', 'could not deliver to page (%s), dropping upstream',
+          tostring(serr))
       closeQuietly(upstream, 'upstream')
+      upstream = nil
       return
     end
   end
@@ -213,7 +266,17 @@ local function acceptPage()
   pageSock = sock
   upstream = nil
   partial = ''
-  log('I', 'page connected (%s), opening upstream', tostring(addr))
+  toPage = ''
+  -- New session: every log-once flag below describes this connection only.
+  sessionNo = sessionNo + 1
+  pageBytesSeen = false
+  silentTicks = 0
+  loggedPageFirst = false
+  loggedUpFirst = false
+  loggedDownFirst = false
+  loggedNoUpstream = false
+  log('I', 'page connected (%s) [session %d], opening upstream',
+      tostring(addr), sessionNo)
 
   if not connectUpstream() then
     log('E', 'no upstream — the page will see a closed stream')
@@ -224,43 +287,115 @@ end
 local function pump()
   if not pageSock then return end
 
-  -- page -> upstream
-  if upstream then
-    -- Same select contract as above: 'timeout' arrives in the third result.
-    local readable, _, _, err = socket.select({ pageSock }, nil, 0)
+  -- Bytes the page socket would not take in one write get another chance here,
+  -- before anything else is read.
+  if toPage ~= '' then
+    local sent, serr = pageSock:send(toPage)
+    if type(sent) == 'number' then
+      toPage = toPage:sub(sent + 1)
+    elseif serr and serr ~= 'timeout' then
+      log('W', 'page write failed (%s), closing the session', tostring(serr))
+      closeQuietly(pageSock, 'page socket')
+      pageSock = nil
+      closeQuietly(upstream, 'upstream')
+      upstream = nil
+      toPage = ''
+      return
+    end
+  end
+
+  -- page -> upstream. Same select contract as above: 'timeout' arrives in the
+  -- third result, and a build whose select fails hands back no table at all -
+  -- #nil would raise straight into the frame hook.
+  local readable, _, _, err = socket.select({ pageSock }, nil, 0)
+  if type(readable) ~= 'table' then
     if err then
       log('W', 'select on page socket failed: %s', tostring(err))
       closeQuietly(pageSock, 'page socket')
-    elseif #readable > 0 then
-      -- receive() through pcall returns (ok, line, err, partial): the pcall
-      -- boolean shifts the real values right by one. Data waiting on a
-      -- non-blocking socket lands in slot 4.
-      local ok, line, rerr, chunk = pcall(pageSock.receive, pageSock, READ_SIZE)
-      if not ok then
-        log('W', 'page receive raised: %s', tostring(line))
-        closeQuietly(pageSock, 'page socket')
-        return
+      pageSock = nil
+      closeQuietly(upstream, 'upstream')
+      upstream = nil
+      toPage = ''
+    end
+    drainUpstream()
+    return
+  end
+
+  if #readable > 0 then
+    -- receive() through pcall returns (ok, line, err, partial): the pcall
+    -- boolean shifts the real values right by one. Data waiting on a
+    -- non-blocking socket lands in slot 4.
+    local ok, line, rerr, chunk = pcall(pageSock.receive, pageSock, READ_SIZE)
+    if not ok then
+      log('W', 'page receive raised: %s', tostring(line))
+      closeQuietly(pageSock, 'page socket')
+      pageSock = nil
+      closeQuietly(upstream, 'upstream')
+      upstream = nil
+      return
+    end
+    if not chunk or chunk == '' then chunk = line end
+    if chunk and chunk ~= '' then
+      pageBytesSeen = true
+      silentTicks = 0
+      bytesToUp = bytesToUp + #chunk
+      if not loggedPageFirst then
+        loggedPageFirst = true
+        -- %c keeps the preview to a single log line whatever the browser sent.
+        log('I', 'page -> upstream: first %d bytes (session %d): %s', #chunk,
+            sessionNo, (chunk:sub(1, 24):gsub('%c', '.')))
       end
-      if not chunk or chunk == '' then chunk = line end
-      if chunk and chunk ~= '' then
-        partial = partial .. chunk
-        -- send() returns the number of bytes written; a would-block write
-        -- returns nil,'timeout'. Keep the unwritten remainder for the next pump
-        -- and only give up on a real error.
-        local sent, serr = upstream:send(partial)
-        if type(sent) == 'number' then
-          partial = partial:sub(sent + 1)
-        elseif serr ~= 'timeout' then
-          log('W', 'upstream send failed (%s), dropping link', tostring(serr))
-          closeQuietly(upstream, 'upstream')
+      partial = partial .. chunk
+    elseif rerr == 'closed' then
+      log('I', 'the browser closed the page socket (session %d)', sessionNo)
+      closeQuietly(pageSock, 'page socket')
+      pageSock = nil
+      closeQuietly(upstream, 'upstream')
+      upstream = nil
+      partial = ''
+      toPage = ''
+      return
+    elseif rerr and rerr ~= 'timeout' then
+      log('W', 'page read: %s', tostring(rerr))
+    end
+  end
+
+  -- Flush what the page sent as soon as there is an upstream to carry it.
+  if partial ~= '' then
+    if upstream then
+      local sent, serr = upstream:send(partial)
+      if type(sent) == 'number' then
+        if not loggedUpFirst and sent > 0 then
+          loggedUpFirst = true
+          log('I', 'forwarded %d bytes to %s:%d (session %d)', sent,
+              M.UPSTREAM_HOST, M.UPSTREAM_PORT, sessionNo)
         end
-      elseif rerr and rerr ~= 'timeout' and rerr ~= 'closed' then
-        log('W', 'page read: %s', tostring(rerr))
+        partial = partial:sub(sent + 1)
+      elseif serr and serr ~= 'timeout' then
+        log('W', 'upstream send failed (%s), dropping link', tostring(serr))
+        closeQuietly(upstream, 'upstream')
+        upstream = nil
       end
+    elseif not loggedNoUpstream then
+      loggedNoUpstream = true
+      log('E', 'the page sent %d bytes but there is no upstream link - '
+          .. 'the handshake cannot be forwarded', #partial)
     end
   end
 
   drainUpstream()
+end
+
+-- Distinguishes "nothing is pumping" from "the browser never spoke". Fires
+-- once per session, after SILENT_TICK_LIMIT UI ticks with no page bytes.
+local function watchdog()
+  if not pageSock or pageBytesSeen then return end
+  silentTicks = silentTicks + 1
+  if silentTicks == SILENT_TICK_LIMIT then
+    log('E', 'page connected for %d ticks without sending a byte - the '
+        .. 'browser never started the WebSocket handshake (CSP, or a blocked '
+        .. 'loopback name)', silentTicks)
+  end
 end
 
 M.setUpstream = function(host, port)
@@ -304,8 +439,13 @@ M.getStatus = function()
       'relay is up on %s:%d, no upstream yet',
       M.LOCAL_HOST, M.LOCAL_PORT)
   end
-  return string.format('relay %s:%d -> %s:%d ok', M.LOCAL_HOST, M.LOCAL_PORT,
-    M.UPSTREAM_HOST, M.UPSTREAM_PORT)
+  -- The byte counters are the point: the page shows this line when the socket
+  -- fails, and "page->up 156B, up->page 0B" says where the stream stopped
+  -- without needing the game log at all.
+  return string.format(
+    'relay %s:%d -> %s:%d ok; session %d, page->up %dB, up->page %dB',
+    M.LOCAL_HOST, M.LOCAL_PORT, M.UPSTREAM_HOST, M.UPSTREAM_PORT,
+    sessionNo, bytesToUp, bytesToPage)
 end
 
 M.start = startListener
@@ -333,6 +473,9 @@ M.onExtensionLoaded = function()
   -- may connect much later.
   if connectUpstream() then
     closeQuietly(upstream, 'upstream probe')
+    -- The probe socket is closed, so the variable must stop pointing at it:
+    -- otherwise getStatus() reports an upstream that is already dead.
+    upstream = nil
   end
 end
 
@@ -360,6 +503,7 @@ M.onGuiUpdate = function()
   end
   acceptPage()
   pump()
+  watchdog()
 end
 
 -- Also pump on graphics frames so the relay keeps working with no UI open, but
@@ -378,6 +522,7 @@ M.onUpdate = function()
   frameCounter = 0
   acceptPage()
   pump()
+  watchdog()
 end
 
 return M

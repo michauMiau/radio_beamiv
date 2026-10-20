@@ -14,6 +14,14 @@ import { baseUrl, relayWsUrl, settings, saveSettings } from "./settings.js"
 // the JS and the .lua file cannot drift apart.
 const EXTENSION = "SendspinRadio"
 
+// The relay can be dialled under either loopback name. BeamNG's CSP has listed
+// `ws://127.0.0.1:*` in some builds and `ws://localhost:*` in others, and a name
+// the policy omits is refused before a byte leaves the page - an instant error,
+// not a timeout. So a failed attempt is retried on the other name instead of
+// being reported as a dead relay.
+const RELAY_HOSTS = ["127.0.0.1", "localhost"]
+let relayHostIndex = 0
+
 export const playerState = reactive({
   /** "idle" | "connecting" | "connected" | "error" */
   status: "idle",
@@ -111,7 +119,7 @@ function createPlayer() {
   // that. So we open a loopback WebSocket ourselves and hand it over: the SDK
   // adopts it (webSocket config, auto-reconnect disabled) and everything then
   // looks like ordinary loopback traffic to the browser.
-  const sock = new WebSocket(relayWsUrl())
+  const sock = new WebSocket(relayWsUrl({ ...settings, relayHost: RELAY_HOSTS[relayHostIndex] }))
 
   player = new SendspinPlayer({
     // baseUrl is still required by the SDK even when webSocket is supplied.
@@ -174,12 +182,37 @@ function waitForSocketOpen(sock, timeoutMs = 5000) {
     const askLua = async () => {
       let report
       try {
+        // The extension's own status is the most useful answer, so try the
+        // direct lookup first. It came back undefined in BeamNG 0.40 even while
+        // the extension was loaded and logging - which is why "not loaded" used
+        // to be reported for a relay that was demonstrably running.
         const ext = lua.extensions?.[EXTENSION]
-        report = ext ? await ext.getStatus() : "Lua extension is not loaded"
+        if (ext && typeof ext.getStatus === "function") {
+          report = await ext.getStatus()
+        } else {
+          // Before claiming it is missing, ask the registry - the same call
+          // onLoad() uses to load it - so a bridge lookup gap cannot masquerade
+          // as an unloaded extension.
+          let loaded = "unknown"
+          try {
+            loaded = await lua.extensions.isExtensionLoaded(EXTENSION)
+          } catch (registryError) {
+            loaded = `unknown (${registryError?.message || registryError})`
+          }
+          report =
+            loaded === true
+              ? "extension is loaded but getStatus() is unreachable over the bridge"
+              : `Lua extension is not loaded (isExtensionLoaded=${loaded})`
+        }
       } catch (e) {
         report = `status call failed: ${e?.message || e}`
       }
-      finish(reject, new Error(`relay unavailable — ${report}`))
+      // readyState separates "never opened" from "opened and then dropped",
+      // which are different failures with different causes.
+      finish(
+        reject,
+        new Error(`relay unavailable — ${report}; socket readyState=${sock.readyState}`),
+      )
     }
 
     sock.addEventListener("open", () => finish(resolve), { once: true })
@@ -197,30 +230,45 @@ export async function connect() {
   playerState.status = "connecting"
   playerState.error = ""
 
-  try {
-    const p = createPlayer()
-    // The SDK adopts the socket, so it has to be open first.
-    await waitForSocketOpen(p.__sock)
-    await p.connect()
-    playerState.status = "connected"
-    playerState.volume = p.volume
-    p.setVolume(settings.volume)
-    startProgressTicker()
-  } catch (e) {
-    playerState.status = "error"
-    playerState.error = describeError(e)
-    // A failed attempt leaves a half-initialised socket behind; drop it so the
-    // next attempt starts from a clean object. `player` is the only live
-    // reference to the socket, so closing the player is what closes it.
-    if (player) {
-      try {
-        player.disconnect()
-      } catch (closeError) {
-        console.warn("Sendspin: disconnect after failed connect threw", closeError)
+  // Bounded: one attempt per loopback name, then report the last failure.
+  for (;;) {
+    try {
+      const p = createPlayer()
+      // The SDK adopts the socket, so it has to be open first.
+      await waitForSocketOpen(p.__sock)
+      await p.connect()
+      playerState.status = "connected"
+      playerState.volume = p.volume
+      p.setVolume(settings.volume)
+      startProgressTicker()
+      return
+    } catch (e) {
+      // A failed attempt leaves a half-initialised socket behind; drop it so the
+      // next attempt starts from a clean object. `player` is the only live
+      // reference to the socket, so closing the player is what closes it.
+      if (player) {
+        try {
+          player.disconnect()
+        } catch (closeError) {
+          console.warn("Sendspin: disconnect after failed connect threw", closeError)
+        }
       }
+      player = null
+      playerState.hasPlayer = false
+
+      if (relayHostIndex < RELAY_HOSTS.length - 1) {
+        relayHostIndex += 1
+        console.warn(
+          `Sendspin: relay at ${RELAY_HOSTS[relayHostIndex - 1]} failed ` +
+            `(${e?.message || e}); retrying on ${RELAY_HOSTS[relayHostIndex]}`,
+        )
+        continue
+      }
+
+      playerState.status = "error"
+      playerState.error = describeError(e)
+      return
     }
-    player = null
-    playerState.hasPlayer = false
   }
 }
 
