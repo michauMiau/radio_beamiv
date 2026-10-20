@@ -30,7 +30,12 @@ jobs:
         # BeamNG runs GELua 5.1; testing against another version would let
         # syntax and socket-contract differences through.
         run: |
-          sudo apt-get update -qq
+          # The runner image ships extra apt sources - Microsoft's was
+          # returning 403 when this was written - which make `apt-get update`
+          # exit non-zero while the Ubuntu archives themselves update fine.
+          # A broken third-party mirror must not fail the gate before the gate
+          # has run, so the update is best-effort and the install decides.
+          sudo apt-get update -qq || true
           sudo apt-get install -y -qq lua5.1 lua-socket
 
       - name: Install luacheck
@@ -68,7 +73,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Lua 5.1 and LuaSocket
         run: |
-          sudo apt-get update -qq
+          # The runner image ships extra apt sources - Microsoft's was
+          # returning 403 when this was written - which make `apt-get update`
+          # exit non-zero while the Ubuntu archives themselves update fine.
+          # A broken third-party mirror must not fail the gate before the gate
+          # has run, so the update is best-effort and the install decides.
+          sudo apt-get update -qq || true
           sudo apt-get install -y -qq lua5.1 lua-socket
       - name: Verify the partial-result contract still holds
         # Binary data arrives ONLY in receive()'s third result. If a toolchain
@@ -82,7 +92,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Lua 5.1 and LuaSocket
         run: |
-          sudo apt-get update -qq
+          # The runner image ships extra apt sources - Microsoft's was
+          # returning 403 when this was written - which make `apt-get update`
+          # exit non-zero while the Ubuntu archives themselves update fine.
+          # A broken third-party mirror must not fail the gate before the gate
+          # has run, so the update is best-effort and the install decides.
+          sudo apt-get update -qq || true
           sudo apt-get install -y -qq lua5.1 lua-socket
       - name: Drive the real extension against a loopback upstream
         # No Music Assistant involved: the test binds loopback ports and
